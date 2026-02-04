@@ -1,18 +1,41 @@
-import asyncio
+# Clear bytecode cache FIRST, before any sparket imports load cached .pyc files
+# This prevents stale code from running after updates
+import shutil
+import sys
+from pathlib import Path
+
+def _clear_bytecode_cache() -> int:
+    """Clear __pycache__ dirs and .pyc files from sparket package."""
+    base = Path(__file__).parent.parent
+    removed = 0
+    for cache_dir in base.rglob("__pycache__"):
+        try:
+            shutil.rmtree(cache_dir)
+            removed += 1
+        except (OSError, PermissionError):
+            pass
+    for pyc_file in base.rglob("*.pyc"):
+        try:
+            pyc_file.unlink()
+        except (OSError, PermissionError):
+            pass
+    return removed
+
+_CLEARED_CACHES = _clear_bytecode_cache()
+if _CLEARED_CACHES > 0:
+    print(f"[validator] Cleared {_CLEARED_CACHES} bytecode cache directories", file=sys.stderr, flush=True)
+
+# Now safe to import the rest
 import os
 import argparse
 import signal
-import sys
 import threading
-import time
 
 import bittensor as bt
 from dotenv import load_dotenv
 from bittensor.core.config import Config as BTConfig
 
 from sparket.validator.validator import BaseValidatorNeuron
-from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
-from sparket.validator.comms import ValidatorComms
 from sparket.shared.logging import suppress_bittensor_header_warnings
 
 
@@ -24,167 +47,11 @@ class Validator(BaseValidatorNeuron):
 
     def __init__(self, config=None):
         super(Validator, self).__init__(config=config)
-
         bt.logging.info("load_state()")
         self.load_state()
-        # Setup comms manager
-        core = getattr(getattr(self, "app_config", None), "core", None)
-        proxy_url = None
-        require = True
-        if core is not None:
-            proxy_url = getattr(core.api, "proxy_url", None)
-            require = bool(getattr(core.api, "require_push_token", True))
-            # Disable token verification in test mode
-            if getattr(core.runtime, "test_mode", False):
-                bt.logging.info({"validator_init": "test_mode_token_verification_disabled"})
-                require = False
-        self.comms = ValidatorComms(proxy_url=proxy_url, require_token=require, step_rotation=10)
-        self._next_connection_push_ts: float = 0.0
-
-
-
-    async def forward(self):
-        # Broadcast validator endpoint details to miners for bidirectional comms
-        interval = getattr(self, "connection_push_interval", 300)
-        now = time.monotonic()
-        if now < getattr(self, "_next_connection_push_ts", 0.0):
-            bt.logging.debug(
-                {
-                    "validator_forward": {
-                        "status": "throttled",
-                        "remaining_seconds": round(getattr(self, "_next_connection_push_ts", 0.0) - now, 2),
-                    }
-                }
-            )
-            return None
-        next_deadline = getattr(self, "_next_connection_push_ts", 0.0)
-        if next_deadline <= 0:
-            self._next_connection_push_ts = now + interval
-        else:
-            self._next_connection_push_ts = now + interval
-
-        target_report = None
-        try:
-            if getattr(self, "axon", None) is not None:
-                ep = self.comms.advertised_endpoint(axon=self.axon)
-                token = self.comms.current_token(step=self.step)
-                bt.logging.info(
-                    {
-                        "validator_forward": {
-                            "status": "broadcasting",
-                            "next_broadcast_in_seconds": interval,
-                            "payload": {
-                                "endpoint": ep,
-                                "token": "redacted" if token else None,
-                            },
-                        }
-                    }
-                )
-                payload = {**ep, "token": token}
-                syn = SparketSynapse(
-                    type=SparketSynapseType.CONNECTION_INFO_PUSH.value,
-                    payload=payload,
-                )
-                validator_flags = getattr(self.metagraph, "validator_permit", None)
-
-                def _is_validator(uid: int) -> bool:
-                    if validator_flags is None:
-                        return False
-                    try:
-                        value = validator_flags[uid]
-                        if hasattr(value, "item"):
-                            value = value.item()
-                        return bool(value)
-                    except Exception:
-                        return False
-
-                my_hotkey = getattr(getattr(self.wallet, "hotkey", None), "ss58_address", None)
-                selected_axons = []
-                try:
-                    def _is_loopback(addr: str | None) -> bool:
-                        if not addr:
-                            return False
-                        lower = addr.lower()
-                        return "127.0.0.1" in lower or "localhost" in lower
-
-                    target_report = []
-                    for uid in range(self.metagraph.n):
-                        axon = self.metagraph.axons[uid]
-                        hotkey = getattr(axon, "hotkey", None)
-                        ip = getattr(axon, "ip", None)
-                        raw_port = getattr(axon, "port", None)
-                        try:
-                            port_value = int(raw_port)
-                        except (TypeError, ValueError):
-                            port_value = None
-                        loopback = _is_loopback(ip)
-                        if _is_validator(uid):
-                            continue
-                        if my_hotkey and hotkey == my_hotkey:
-                            continue
-                        if not ip or port_value is None or port_value <= 0:
-                            continue
-                        target_report.append(
-                            {
-                                "uid": uid,
-                                "hotkey": hotkey,
-                                "ip": ip,
-                                "port": port_value,
-                                "loopback": loopback,
-                            }
-                        )
-                        selected_axons.append(axon)
-
-                    external_targets = [t for t in target_report if not t["loopback"]]
-                    bt.logging.debug(
-                        {
-                            "forward_targets": {
-                                "total": len(target_report),
-                                "external_count": len(external_targets),
-                                "external_sample": external_targets[:5],
-                            }
-                        }
-                    )
-                except Exception:
-                    pass
-
-                if not selected_axons:
-                    bt.logging.warning(
-                        {
-                            "validator_forward": {
-                                "status": "no_targets",
-                                "reason": "no_miner_endpoints_available",
-                            }
-                        }
-                    )
-                    return None
-
-                await self.dendrite(
-                    axons=selected_axons,
-                    synapse=syn,
-                    deserialize=True,
-                )
-                bt.logging.info(
-                    {
-                        "validator_forward": {
-                            "status": "broadcast_complete",
-                            "target_count": len(selected_axons),
-                        }
-                    }
-                )
-                # NOTE: Don't sleep here - the main loop handles timing via time.sleep(30)
-        except Exception as e:
-            try:
-                extra = {"error": str(e), "type": e.__class__.__name__}
-                if target_report is not None:
-                    external_only = [t for t in target_report if not t["loopback"]]
-                    extra["targets_external_count"] = len(external_only)
-                    extra["targets_external_sample"] = external_only[:5]
-                    extra["targets_sample"] = target_report[:5]
-                bt.logging.warning({"validator_broadcast_error": extra})
-            except Exception:
-                bt.logging.warning({"validator_broadcast_error": str(e)})
-        return None
+    
+    # NOTE: forward() method is inherited from BaseValidatorNeuron (validator.py)
+    # Do NOT override it here - broadcast logic should stay in one place
 
 
 # The main function parses the configuration and runs the validator.

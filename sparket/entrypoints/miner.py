@@ -1,7 +1,34 @@
+# Clear bytecode cache FIRST, before any sparket imports load cached .pyc files
+# This prevents stale code from running after updates
+import shutil
+import sys
+from pathlib import Path
+
+def _clear_bytecode_cache() -> int:
+    """Clear __pycache__ dirs and .pyc files from sparket package."""
+    base = Path(__file__).parent.parent
+    removed = 0
+    for cache_dir in base.rglob("__pycache__"):
+        try:
+            shutil.rmtree(cache_dir)
+            removed += 1
+        except (OSError, PermissionError):
+            pass
+    for pyc_file in base.rglob("*.pyc"):
+        try:
+            pyc_file.unlink()
+        except (OSError, PermissionError):
+            pass
+    return removed
+
+_CLEARED_CACHES = _clear_bytecode_cache()
+if _CLEARED_CACHES > 0:
+    print(f"[miner] Cleared {_CLEARED_CACHES} bytecode cache directories", file=sys.stderr, flush=True)
+
+# Now safe to import the rest
 import argparse
 import asyncio
 import os
-import shutil
 import signal
 import threading
 
@@ -155,7 +182,16 @@ class Miner(BaseMinerNeuron):
         
         super(Miner, self).__init__(config=config)
 
+        # Prevent double-logging from bittensor's standard Python logger
+        # (bittensor has its own console handler, so we disable propagation
+        # to prevent the root logger from also printing the same messages)
+        import logging as std_logging
+        bt_logger = std_logging.getLogger("bittensor")
+        bt_logger.propagate = False
+
         self._validator_cache: dict[str, dict[str, object]] = {}
+        # Primary validator endpoint (set when CONNECTION_INFO_PUSH received)
+        self.validator_endpoint: Optional[dict[str, object]] = None
         
         # Base miner for automatic odds generation
         self.base_miner: Optional["BaseMiner"] = None
@@ -166,11 +202,34 @@ class Miner(BaseMinerNeuron):
         Currently processes connection info push messages and returns the
         synapse unchanged.
         """
+        import time as _time
+        start = _time.monotonic()
+        syn_type = _extract_synapse_type(synapse)
+        hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
+        hotkey_short = hotkey[:16] + "..." if hotkey and len(hotkey) > 16 else hotkey
+        
+        bt.logging.debug({
+            "miner_forward": {
+                "status": "received",
+                "type": syn_type,
+                "from_hotkey": hotkey_short,
+            }
+        })
+        
         try:
-            if _extract_synapse_type(synapse) == SparketSynapseType.CONNECTION_INFO_PUSH.value and isinstance(synapse.payload, dict):
+            if syn_type == SparketSynapseType.CONNECTION_INFO_PUSH.value and isinstance(synapse.payload, dict):
                 await self._handle_connection_push(synapse)
+                elapsed = _time.monotonic() - start
+                bt.logging.info({
+                    "miner_forward": {
+                        "status": "connection_push_handled",
+                        "from_hotkey": hotkey_short,
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
+                })
         except Exception as exc:
             bt.logging.warning({"miner_forward_error": str(exc)})
+        
         return synapse
 
     async def blacklist(
@@ -182,7 +241,7 @@ class Miner(BaseMinerNeuron):
         validator permit checks. Connection info pushes can be allowed
         even when validator permit is required.
         """
-
+        syn_type = _extract_synapse_type(synapse)
         allow_conn_push = _allow_unpermitted_connection_push(self.app_config, synapse)
 
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
@@ -192,39 +251,66 @@ class Miner(BaseMinerNeuron):
             return True, "Missing dendrite or hotkey"
 
         hotkey = synapse.dendrite.hotkey
+        hotkey_short = hotkey[:16] + "..." if len(hotkey) > 16 else hotkey
 
+        # For CONNECTION_INFO_PUSH, always allow from registered validators
+        # even if allow_connection_info_from_unpermitted_validators is False
+        is_connection_push = syn_type == SparketSynapseType.CONNECTION_INFO_PUSH.value
+        
         if allow_conn_push:
-            bt.logging.debug(
-                {
-                    "miner_blacklist": {
-                        "status": "connection_info_push_allowed",
-                        "hotkey": hotkey,
-                    }
+            bt.logging.debug({
+                "miner_blacklist": {
+                    "status": "allowed",
+                    "reason": "connection_push_allowed_by_config",
+                    "hotkey": hotkey_short,
                 }
-            )
+            })
             return False, "connection_info_push_allowed"
 
         if (
             not self.config.blacklist.allow_non_registered
             and hotkey not in self.metagraph.hotkeys
         ):
-            # Ignore requests from un-registered entities.
-            bt.logging.trace(f"Blacklisting un-registered hotkey {hotkey}")
+            bt.logging.warning({
+                "miner_blacklist": {
+                    "status": "blocked",
+                    "reason": "unregistered_hotkey",
+                    "hotkey": hotkey_short,
+                    "synapse_type": syn_type,
+                }
+            })
             return True, "Unrecognized hotkey"
 
         uid = self.metagraph.hotkeys.index(hotkey)
 
         if self.config.blacklist.force_validator_permit:
-            # If the config is set to force validator permit, then we should only allow requests from validators.
-            if uid >= len(self.metagraph.validator_permit) or not self.metagraph.validator_permit[uid]:
-                bt.logging.warning(
-                    f"Blacklisting a request from non-validator hotkey {hotkey}"
-                )
+            has_permit = uid < len(self.metagraph.validator_permit) and self.metagraph.validator_permit[uid]
+            if not has_permit:
+                # Allow CONNECTION_INFO_PUSH from registered hotkeys even without validator permit
+                # This ensures miners can receive connection info during validator startup
+                if is_connection_push:
+                    bt.logging.debug({
+                        "miner_blacklist": {
+                            "status": "allowed",
+                            "reason": "connection_push_from_registered",
+                            "hotkey": hotkey_short,
+                            "uid": uid,
+                        }
+                    })
+                    return False, "connection_push_from_registered"
+                    
+                bt.logging.warning({
+                    "miner_blacklist": {
+                        "status": "blocked",
+                        "reason": "no_validator_permit",
+                        "hotkey": hotkey_short,
+                        "uid": uid,
+                        "synapse_type": syn_type,
+                    }
+                })
                 return True, "Non-validator hotkey"
 
-        bt.logging.trace(
-            f"Not Blacklisting recognized hotkey {synapse.dendrite.hotkey}"
-        )
+        bt.logging.trace(f"Not Blacklisting recognized hotkey {hotkey_short}")
         return False, "Hotkey recognized!"
 
     async def priority(self, synapse: SparketSynapse) -> float:
@@ -276,13 +362,25 @@ class Miner(BaseMinerNeuron):
             url=url,
             token=token,
         )
-        self._validator_cache[hotkey] = {
+        endpoint_data = {
+            "hotkey": hotkey,
             "host": host,
             "port": port,
             "url": url,
             "token": token,
         }
-        bt.logging.info({"miner_validator_endpoint_updated": {"hotkey": hotkey, "host": host, "port": port, "url": url}})
+        self._validator_cache[hotkey] = endpoint_data
+        # Also set the primary validator_endpoint for MinerService/ValidatorClient to use
+        self.validator_endpoint = endpoint_data
+        bt.logging.info({
+            "miner_validator_endpoint_updated": {
+                "hotkey": hotkey,
+                "host": host,
+                "port": port,
+                "url": url,
+                "token_received": bool(token),
+            }
+        })
 
     def initialize_base_miner(self) -> bool:
         """Initialize the base miner for automatic odds generation.
@@ -313,11 +411,17 @@ class Miner(BaseMinerNeuron):
         
         try:
             hotkey = self.wallet.hotkey.ss58_address
+            # Token getter for base miner authentication
+            def _get_token() -> Optional[str]:
+                endpoint = getattr(self, "validator_endpoint", None) or {}
+                return endpoint.get("token") if isinstance(endpoint, dict) else None
+            
             self.base_miner = BaseMiner(
                 hotkey=hotkey,
                 config=base_config,
                 validator_client=self.validator_client,
                 game_sync=self.game_sync,
+                get_token=_get_token,
             )
             bt.logging.info({
                 "base_miner": "initialized",
