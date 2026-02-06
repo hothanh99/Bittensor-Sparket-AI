@@ -54,7 +54,8 @@ _SELECT_LAST_SYNC = text(
 
 _SELECT_ACTIVE_MARKETS = text(
     """
-    SELECT m.market_id, m.event_id, m.kind, m.line, e.start_time_utc
+    SELECT m.market_id, m.event_id, m.kind, m.line, e.start_time_utc,
+           e.home_team, e.away_team, e.sport, e.league
     FROM market m
     JOIN event e ON e.event_id = m.event_id
     WHERE e.status = 'scheduled'
@@ -192,7 +193,6 @@ class GameDataSync:
             rows = await self.database.read(
                 _SELECT_ACTIVE_MARKETS,
                 params={"now": now},
-                mappings=True,
             )
             return [
                 {
@@ -201,6 +201,10 @@ class GameDataSync:
                     "kind": str(r["kind"]),
                     "line": float(r["line"]) if r.get("line") else None,
                     "start_time_utc": r["start_time_utc"],
+                    "home_team": r.get("home_team") or "",
+                    "away_team": r.get("away_team") or "",
+                    "sport": r.get("sport") or "NFL",
+                    "league": r.get("league"),
                 }
                 for r in rows
             ]

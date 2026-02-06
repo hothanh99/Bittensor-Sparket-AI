@@ -172,9 +172,16 @@ class Miner(BaseMinerNeuron):
                 if env_axon_port:
                     cfg.axon.port = int(env_axon_port)
                     cfg.axon.external_port = int(env_axon_port)
+                env_axon_external_ip = os.getenv("SPARKET_AXON__EXTERNAL_IP")
+                env_axon_external_port = os.getenv("SPARKET_AXON__EXTERNAL_PORT")
                 if env_axon_host:
                     cfg.axon.ip = env_axon_host
                     cfg.axon.external_ip = env_axon_host
+                # Dedicated external IP/port override (highest priority)
+                if env_axon_external_ip:
+                    cfg.axon.external_ip = env_axon_external_ip
+                if env_axon_external_port:
+                    cfg.axon.external_port = int(env_axon_external_port)
                 
                 config = cfg
             except Exception:
@@ -469,15 +476,36 @@ async def _log_validator_endpoints(miner: Miner) -> None:
 
 
 async def _start_base_miner_async(miner: Miner) -> None:
-    """Start base miner in async context."""
+    """Start base miner and game data sync in async context."""
+    if miner.game_sync is not None:
+        await miner.game_sync.start()
+        await miner.game_sync.sync_once()
     if miner.base_miner is not None:
         await miner.base_miner.start()
 
 
 async def _stop_base_miner_async(miner: Miner) -> None:
-    """Stop base miner in async context."""
+    """Stop base miner and game data sync in async context."""
     if miner.base_miner is not None:
         await miner.base_miner.stop()
+    if miner.game_sync is not None:
+        await miner.game_sync.stop()
+
+
+async def _run_miner_with_async_tasks(miner: Miner, stop_event: threading.Event) -> None:
+    """Keep asyncio loop alive: run game_sync + base_miner (submit odds) while miner.run() runs in a thread."""
+    await _start_base_miner_async(miner)
+    bt.logging.info({"base_miner": "started"})
+    miner_thread = threading.Thread(target=miner.run, daemon=False)
+    miner_thread.start()
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(0.5)
+    finally:
+        await _stop_base_miner_async(miner)
+        bt.logging.info({"base_miner": "stopped"})
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: miner_thread.join(15))
 
 
 if __name__ == "__main__":
@@ -487,30 +515,28 @@ if __name__ == "__main__":
     bt.logging.info({"current_working_directory": os.getcwd()})
 
     stop_event = threading.Event()
-
     received_signal: dict[str, int] = {"signum": 0}
+    shutting_down: list[bool] = [False]  # list to allow assign in closure
+
+    miner = Miner()
 
     def _handle_signal(signum, frame):
         received_signal["signum"] = signum
         stop_event.set()
+        miner.should_exit = True
+        if not shutting_down[0]:
+            shutting_down[0] = True
+            bt.logging.info({"miner_signal": signum, "shutting_down": True})
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
-
-    miner = Miner()
     
     # Initialize base miner (enabled by default; disable with SPARKET_BASE_MINER__ENABLED=false)
     # This provides automatic odds generation using ESPN data + optional The-Odds-API
     base_miner_initialized = miner.initialize_base_miner()
-    if base_miner_initialized:
-        try:
-            asyncio.run(_start_base_miner_async(miner))
-            bt.logging.info({"base_miner": "started"})
-        except Exception as e:
-            bt.logging.warning({"base_miner": "start_failed", "error": str(e)})
     
     # Start control API for external model integration
-    # Configure via SPARKET_MINER_API_PORT (default: 8198) 
+    # Configure via SPARKET_MINER_API_PORT (default: 8198)
     # Disable with SPARKET_MINER_API_ENABLED=false
     control_api = None
     api_enabled = os.getenv("SPARKET_MINER_API_ENABLED", "true").lower() not in ("false", "0", "no")
@@ -532,11 +558,13 @@ if __name__ == "__main__":
             bt.logging.warning({"miner_api": "failed_to_start", "error": str(e)})
     
     try:
-        miner.run()
+        if base_miner_initialized:
+            asyncio.run(_run_miner_with_async_tasks(miner, stop_event))
+        else:
+            miner.run()
     except KeyboardInterrupt:
         stop_event.set()
     finally:
-        # Stop base miner
         if miner.base_miner is not None:
             try:
                 asyncio.run(_stop_base_miner_async(miner))

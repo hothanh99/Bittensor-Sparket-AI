@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import sqlite3
 from typing import Any
 
 import bittensor as bt
@@ -41,8 +42,28 @@ def check_python_requirements() -> None:
             )
 
 
+def ping_database_sync(db_path: str) -> bool:
+    """Synchronous ping using sqlite3. Use at startup to avoid aiosqlite thread vs event-loop races."""
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            conn.execute("select 1")
+        bt.logging.info({"miner_startup": {"step": "database_ping", "status": "ok"}})
+        return True
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics
+        bt.logging.error(
+            {
+                "miner_startup": {
+                    "step": "database_ping",
+                    "status": "error",
+                    "error": str(exc),
+                }
+            }
+        )
+        return False
+
+
 async def ping_database(dbm: Any) -> bool:
-    """Execute a simple read to confirm the miner database is reachable."""
+    """Execute a simple read to confirm the miner database is reachable (async)."""
     try:
         await dbm.read(text("select 1"))
         bt.logging.info({"miner_startup": {"step": "database_ping", "status": "ok"}})
