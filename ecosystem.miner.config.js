@@ -49,13 +49,13 @@ try {
 }
 
 console.log(
-  `Miner PM2 will run from ${projectRoot}. Loaded ${Object.keys(envVars).length} environment variables from .env`
+  `PM2 sparket1 (sparket/entrypoints/miner.py) from ${projectRoot}. Loaded ${Object.keys(envVars).length} env vars from .env`
 );
 
 module.exports = {
   apps: [
     {
-      name: 'miner-local',
+      name: 'sparket1',
       script: scriptPath,
       interpreter,
       cwd: projectRoot,
@@ -69,10 +69,11 @@ module.exports = {
         PM2_LOG_DIR: logDir,
         VENV_PYTHON: interpreter,
         SPARKET_AXON__HOST: envVars.SPARKET_AXON__HOST || '0.0.0.0',
-        SPARKET_AXON__PORT: envVars.SPARKET_AXON__PORT || '8094',
+        SPARKET_AXON__PORT: envVars.SPARKET_AXON__PORT || '8091',
         SPARKET_MINER_CONFIG_FILE: envVars.SPARKET_MINER_CONFIG_FILE || path.join(projectRoot, 'sparket', 'config', 'miner.yaml'),
         SPARKET_CONFIG_FILE: envVars.SPARKET_CONFIG_FILE || path.join(projectRoot, 'sparket', 'config', 'miner.yaml'),
         SPARKET_ROLE: 'miner',
+        SPARKET_BASE_MINER__ODDS_REFRESH_SECONDS: envVars.SPARKET_BASE_MINER__ODDS_REFRESH_SECONDS || '900',
         ...envVars,
       },
       autorestart: true,
@@ -81,13 +82,13 @@ module.exports = {
       min_uptime: '10s',
       max_restarts: 10,
       restart_delay: 4000,
-      error_file: path.join(logDir, 'miner-local-error.log'),
-      out_file: path.join(logDir, 'miner-local-out.log'),
-      log_file: path.join(logDir, 'miner-local-combined.log'),
+      error_file: path.join(logDir, 'sparket1-error.log'),
+      out_file: path.join(logDir, 'sparket1-out.log'),
+      log_file: path.join(logDir, 'sparket1-combined.log'),
       time: true,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       merge_logs: true,
-      kill_timeout: 5000,
+      kill_timeout: 15000,
       wait_ready: false,
       listen_timeout: 10000,
       instance_var: 'NODE_APP_INSTANCE',

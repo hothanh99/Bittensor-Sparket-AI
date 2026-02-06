@@ -29,32 +29,18 @@ import bittensor as bt
 from sparket.base.neuron import BaseNeuron
 from sparket.base.config import add_miner_args
 
-from typing import Any, Awaitable, Callable, Tuple, TypeVar, Union
+from typing import Any, Tuple, Union
 
 from sparket.miner.config.config import Config as MinerAppConfig
 from sparket.miner.database import DBM, initialize
 from sparket.miner.utils import (
     check_python_requirements,
-    ping_database,
+    ping_database_sync,
     summarize_miner_state,
 )
 from sparket.protocol.protocol import SparketSynapse  # Required for axon.attach type resolution
 
-T = TypeVar("T")
 METAGRAPH_SYNC_COOLDOWN_SECONDS = 120
-
-
-def _run_coroutine(factory: Callable[[], Awaitable[T]]) -> T:
-    try:
-        return asyncio.run(factory())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(factory())
-        finally:
-            asyncio.set_event_loop(None)
-            loop.close()
 
 
 class BaseMinerNeuron(BaseNeuron):
@@ -114,7 +100,7 @@ class BaseMinerNeuron(BaseNeuron):
             if self.dbm is not None:
                 bt.logging.info({"miner_init": {"step": "pinging_database"}})
                 try:
-                    ok = _run_coroutine(lambda: ping_database(self.dbm))
+                    ok = ping_database_sync(self.dbm.db_path)
                     if not ok:
                         bt.logging.error({"miner_init": {"step": "database_ping_failed"}})
                 except Exception as exc:  # pragma: no cover - diagnostics
@@ -281,13 +267,20 @@ class BaseMinerNeuron(BaseNeuron):
                         }
                     }
                 )
-                time.sleep(METAGRAPH_SYNC_COOLDOWN_SECONDS)
+                # Sleep in 1s chunks so Ctrl+C (should_exit) is honoured within ~1s
+                for _ in range(METAGRAPH_SYNC_COOLDOWN_SECONDS):
+                    if self.should_exit:
+                        break
+                    time.sleep(1)
+
+            # Exited via should_exit (e.g. SIGINT/SIGTERM): stop axon and exit cleanly.
+            self.axon.stop()
+            bt.logging.success("Miner stopped (signal or shutdown).")
 
         # If someone intentionally stops the miner, it'll safely terminate operations.
         except KeyboardInterrupt:
             self.axon.stop()
             bt.logging.success("Miner killed by keyboard interrupt.")
-            exit()
 
         # In case of unforeseen errors, the miner will log the error and continue operations.
         except Exception as e:

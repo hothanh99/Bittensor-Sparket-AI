@@ -168,6 +168,8 @@ class BaseNeuron(ABC):
             env_wallet_hotkey = os.getenv("SPARKET_WALLET__HOTKEY")
             env_axon_port = os.getenv("SPARKET_AXON__PORT")
             env_axon_host = os.getenv("SPARKET_AXON__HOST")
+            env_axon_external_ip = os.getenv("SPARKET_AXON__EXTERNAL_IP")
+            env_axon_external_port = os.getenv("SPARKET_AXON__EXTERNAL_PORT")
             if env_wallet_name:
                 self.config.wallet.name = env_wallet_name
             if env_wallet_hotkey:
@@ -178,6 +180,10 @@ class BaseNeuron(ABC):
             if env_axon_host:
                 self.config.axon.ip = env_axon_host
                 self.config.axon.external_ip = env_axon_host
+            if env_axon_external_ip:
+                self.config.axon.external_ip = env_axon_external_ip
+            if env_axon_external_port:
+                self.config.axon.external_port = int(env_axon_external_port)
             
             # Snapshot after override
             try:
@@ -206,6 +212,8 @@ class BaseNeuron(ABC):
             pass
 
         # Force axon bindings to loopback when operating on local network
+        # Skip entirely if user set external IP (mainnet / production)
+        env_external_ip = os.getenv("SPARKET_AXON__EXTERNAL_IP")
         try:
             config_subtensor = getattr(self.config, "subtensor", None)
             config_axon = getattr(self.config, "axon", None)
@@ -221,7 +229,7 @@ class BaseNeuron(ABC):
             config_net = getattr(config_subtensor, "network", None) if config_subtensor else None
             if not wants_local and isinstance(config_net, str) and config_net.lower() == "local":
                 wants_local = True
-            if wants_local and config_axon is not None:
+            if wants_local and config_axon is not None and not env_external_ip:
                 def _to_int(value: typing.Any) -> typing.Optional[int]:
                     try:
                         if value is None:
@@ -262,9 +270,12 @@ class BaseNeuron(ABC):
                     configured_port = default_port
                 port_value = int(configured_port)
                 setattr(config_axon, "ip", override_host)
-                setattr(config_axon, "external_ip", override_host)
                 setattr(config_axon, "port", port_value)
-                setattr(config_axon, "external_port", port_value)
+                env_external_port = os.getenv("SPARKET_AXON__EXTERNAL_PORT")
+                if not env_external_ip:
+                    setattr(config_axon, "external_ip", override_host)
+                if not env_external_port:
+                    setattr(config_axon, "external_port", port_value)
                 bt.logging.info({
                     "axon_override": {
                         "reason": "local_network",
@@ -277,6 +288,20 @@ class BaseNeuron(ABC):
         except Exception:
             pass
         self.check_config(self.config)
+
+        # Ensure external axon values persist so bt.Axon / serve_axon use them
+        try:
+            env_external_ip = os.getenv("SPARKET_AXON__EXTERNAL_IP")
+            env_external_port = os.getenv("SPARKET_AXON__EXTERNAL_PORT")
+            if env_external_ip or env_external_port:
+                axon_cfg = getattr(self.config, "axon", None)
+                if axon_cfg is not None:
+                    if env_external_ip:
+                        setattr(axon_cfg, "external_ip", env_external_ip)
+                    if env_external_port:
+                        setattr(axon_cfg, "external_port", int(env_external_port))
+        except Exception:
+            pass
 
         # Set up logging with the provided configuration.
         bt.logging.set_config(config=self.config.logging)
