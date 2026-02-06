@@ -1,0 +1,34 @@
+role: miner
+
+chain:
+  netuid: 57
+  endpoint: wss://entrypoint-finney.opentensor.ai:443
+
+wallet:
+  name: thanhho99
+  hotkey: thanhho-hotkey2
+
+subtensor:
+  network: finney
+
+axon:
+  host: 188.68.38.56
+  port: 8091
+
+miner:
+  markets: []
+  events: []
+  allow_connection_info_from_unpermitted_validators: false
+  cadence:
+    odds_seconds: 60
+    outcomes_seconds: 120
+  rate:
+    global_per_minute: 60
+    per_market_per_minute: 6
+  retry:
+    max_attempts: 3
+    initial_backoff_ms: 250
+    max_backoff_ms: 2000
+  idempotency:
+    bucket_seconds: 60
+

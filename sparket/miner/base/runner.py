@@ -83,6 +83,8 @@ class BaseMiner:
         self._tasks: List[asyncio.Task] = []
         self._stats_cache = TTLCache[TeamStats](ttl_seconds=config.stats_refresh_seconds)
         self._errors_count = 0
+        # Avoid duplicate stats_unavailable logs per cycle (one per matchup, not per market)
+        self._logged_stats_unavailable_cycle: set = set()
     
     @property
     def is_running(self) -> bool:
@@ -176,12 +178,15 @@ class BaseMiner:
         away_stats = await self._get_team_stats(away_team, sport)
         
         if not home_stats or not away_stats:
-            # Fall back to naive engine
-            bt.logging.debug({
-                "base_miner": "stats_unavailable",
-                "home_team": home_team,
-                "away_team": away_team,
-            })
+            # Fall back to naive engine; log once per matchup per cycle (not per market)
+            key = (home_team, away_team)
+            if key not in self._logged_stats_unavailable_cycle:
+                self._logged_stats_unavailable_cycle.add(key)
+                bt.logging.debug({
+                    "base_miner": "stats_unavailable",
+                    "home_team": home_team,
+                    "away_team": away_team,
+                })
             return await self._naive.get_odds(market)
         
         # 2. Calculate team strengths
@@ -206,11 +211,18 @@ class BaseMiner:
             away_odds_eu=probability_to_odds(away_prob, self.config.vig),
         )
         
-        # 4. Try to get market odds
+        # 4. Try to get market odds (The-Odds-API)
         market_odds = None
         if self._theodds:
             try:
                 market_odds = await self._theodds.get_odds(market)
+                if market_odds is not None:
+                    bt.logging.debug({
+                        "base_miner": "odds_api_used",
+                        "market_id": market.get("market_id"),
+                        "home_team": home_team,
+                        "away_team": away_team,
+                    })
             except Exception as e:
                 bt.logging.debug({"base_miner": "theodds_fetch_failed", "error": str(e)})
         
@@ -269,6 +281,7 @@ class BaseMiner:
         Collects odds for all markets, then submits in batches to reduce
         network overhead. Batch size is configurable via config.batch_size.
         """
+        self._logged_stats_unavailable_cycle.clear()
         # Get active markets from game sync
         markets = await self.game_sync.get_active_markets()
         
@@ -294,6 +307,19 @@ class BaseMiner:
                 # Submit when batch is full
                 if len(batch) >= self.config.batch_size:
                     payload = self._build_batch_payload(batch)
+                    if batch_count == 0 and payload.get("submissions"):
+                        sample = payload["submissions"][0]
+                        bt.logging.info({
+                            "base_miner_odds_sample": {
+                                "one_submission": {
+                                    "market_id": sample.get("market_id"),
+                                    "kind": sample.get("kind"),
+                                    "priced_at": sample.get("priced_at"),
+                                    "prices": sample.get("prices"),
+                                },
+                                "batch_size": len(payload["submissions"]),
+                            }
+                        })
                     success = await self.validator_client.submit_odds(payload)
                     if success:
                         total_submitted += len(batch)
@@ -312,6 +338,19 @@ class BaseMiner:
         if batch:
             try:
                 payload = self._build_batch_payload(batch)
+                if batch_count == 0 and payload.get("submissions"):
+                    sample = payload["submissions"][0]
+                    bt.logging.info({
+                        "base_miner_odds_sample": {
+                            "one_submission": {
+                                "market_id": sample.get("market_id"),
+                                "kind": sample.get("kind"),
+                                "priced_at": sample.get("priced_at"),
+                                "prices": sample.get("prices"),
+                            },
+                            "batch_size": len(payload["submissions"]),
+                        }
+                    })
                 success = await self.validator_client.submit_odds(payload)
                 if success:
                     total_submitted += len(batch)

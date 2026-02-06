@@ -205,6 +205,20 @@ class ValidatorClient:
                 self._trigger_backoff()
             elif success:
                 self._reset_backoff()
+                submissions = (payload or {}).get("submissions", [])
+                one = submissions[0] if submissions else None
+                bt.logging.info({
+                    "submit_odds": {
+                        "accepted": True,
+                        "count": len(submissions),
+                        "sample": {
+                            "market_id": one.get("market_id"),
+                            "kind": one.get("kind"),
+                            "priced_at": one.get("priced_at"),
+                            "prices": one.get("prices"),
+                        } if one else None,
+                    }
+                })
             
             return success
         except Exception as e:
@@ -285,6 +299,15 @@ class ValidatorClient:
         if not axons:
             bt.logging.warning({"fetch_game_data": "no_validators_available"})
             return None
+
+        uid = getattr(axons[0], "uid", None) if axons else None
+        bt.logging.info({
+            "game_data_request": {
+                "sending": True,
+                "since_ts": since_ts.isoformat() if since_ts else None,
+                "validator_uid": int(uid) if uid is not None else None,
+            }
+        })
         
         # Try each validator until one responds successfully
         last_error: str | None = None
@@ -299,7 +322,6 @@ class ValidatorClient:
                 if not responses or len(responses) == 0:
                     last_error = "empty_response"
                     continue
-
                 response = responses[0]
 
                 # Check dendrite status code FIRST before processing response
